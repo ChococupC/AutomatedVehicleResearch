@@ -1,11 +1,9 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+from lib.graph import create_participant_graphs
 
 # Attempt importing custom module (with fallback for testing)
 try:
-    from file_tools import load_participant
+    from lib.file_tools import load_participant
 except ImportError:
     class DummyParticipant:
         def __init__(self, file):
@@ -19,51 +17,23 @@ except ImportError:
     def load_participant(file):
         return DummyParticipant(file)
 
-
-# Placeholder Function
-def create_participant_graphs(p_obj):
-    p_name = p_obj.get_name()
-    graphs = []
-
-    # Graph 1: Time Series / Signal
-    fig1, ax1 = plt.subplots(figsize=(4, 2.8))
-    x = np.linspace(0, 10, 100)
-    y = np.sin(x + np.random.rand() * 2)
-    ax1.plot(x, y, color="#1f77b4", linewidth=2)
-    ax1.set_title(f"{p_name} — Sensor Signal", fontsize=10)
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    plt.tight_layout()
-
-    graphs.append({
-        "id": f"{p_name}_signal",
-        "title": f"{p_name} — Sensor Signal",
-        "fig": fig1
-    })
-
-    # Graph 2: Bar Chart
-    fig2, ax2 = plt.subplots(figsize=(4, 2.8))
-    categories = ['Alpha', 'Beta', 'Gamma', 'Delta']
-    values = np.random.randint(15, 85, size=4)
-    ax2.bar(categories, values, color="#2ca02c", alpha=0.85)
-    ax2.set_title(f"{p_name} — Performance", fontsize=10)
-    ax2.grid(True, linestyle="--", alpha=0.5)
-    plt.tight_layout()
-
-    graphs.append({
-        "id": f"{p_name}_metrics",
-        "title": f"{p_name} — Performance",
-        "fig": fig2
-    })
-
-    return graphs
-
+# Download Feature
+import io
+import datetime as dt
+def get_figure_bytes(fig, dpi=300) -> bytes:
+    """Converts a matplotlib figure into PNG bytes for downloading."""
+    buf = io.BytesIO()
+    # dpi=300 ensures publication-quality resolution
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
+    buf.seek(0)
+    return buf.getvalue()
 
 # Page Setup
 st.set_page_config(page_title="Research Graph Dashboard", layout="wide")
 
 # Session State Initialization
 if "participants" not in st.session_state:
-    st.session_state.participants = []  # List of p_name strings (max 5)
+    st.session_state.participants = []  # List of p_name strings
 if "participant_objs" not in st.session_state:
     st.session_state.participant_objs = {}  # {p_name: p_obj}
 if "loaded_file_ids" not in st.session_state:
@@ -111,10 +81,8 @@ with left_col:
 
     # Process Button (Generates Graphs for loaded participants)
     if st.button("Process CSV Files", type="primary"):
-        if st.session_state.participants:
-            for p_name in st.session_state.participants:
-                p_obj = st.session_state.participant_objs[p_name]
-                st.session_state.graphs[p_name] = create_participant_graphs(p_obj)
+        if st.session_state.participant_objs:
+            st.session_state.graphs = create_participant_graphs(st.session_state.participant_objs.values())
             st.success("Graphs processed successfully!")
             st.rerun()
         else:
@@ -158,6 +126,25 @@ with right_col:
         if st.session_state.graphs:
             mini_cols = st.columns(2)
             idx = 0
+
+            for graph_data in st.session_state.graphs["Overall"]:
+                with mini_cols[idx % 2]:
+                    st.caption(f"**{graph_data['title']}**")
+                    st.pyplot(graph_data["fig"], use_container_width=True)
+
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button("Expand", key=f"btn_exp_{graph_data['id']}"):
+                            st.session_state.selected_graph = graph_data
+                    with btn_col2:
+                        st.download_button(
+                            label="Save",
+                            data=get_figure_bytes(graph_data["fig"]),
+                            file_name=f"{graph_data['id']}_{dt.date.today()}.png",
+                            mime="image/png",
+                            key=f"btn_dl_{graph_data['id']}"
+                        )
+                idx += 1
 
             for p_name in st.session_state.participants:
                 if p_name in st.session_state.graphs:

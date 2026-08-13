@@ -14,7 +14,6 @@ class Participant:
             print("Failed, No name given")
             raise ValueError("Method failed, Name can not be null")
         self.name = name
-        print("Participant name have been set")
 
     def get_data_items(self) -> list:
         output_data = [ i.to_dict() for i in self.data ]

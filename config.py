@@ -1,4 +1,4 @@
 
 # GLOBAL VARIABLE
 NAME = "Automated Vehicle Research"
-VERSION = 1.0
+VERSION = 1.1

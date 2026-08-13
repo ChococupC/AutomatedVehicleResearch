@@ -1,6 +1,6 @@
 import json
 import csv
-from participant import Participant
+from lib.participant import Participant
 import pandas as pd
 
 def load_participant(path):
