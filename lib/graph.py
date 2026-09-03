@@ -6,11 +6,10 @@ import seaborn as sns
 # Set global Seaborn style
 sns.set_theme(style="whitegrid")
 
-
 def extract_df_from_participant(p_obj) -> pd.DataFrame:
     """Helper to extract a pandas DataFrame from various participant object structures."""
-    if hasattr(p_obj, "data") and isinstance(p_obj.data, pd.DataFrame):
-        return p_obj.data.copy()
+    if hasattr(p_obj, "data_frame") and isinstance(p_obj.data_frame, pd.DataFrame):
+        return p_obj.data_frame.copy()
     elif hasattr(p_obj, "file"):
         if hasattr(p_obj.file, "seek"):
             p_obj.file.seek(0)
@@ -21,12 +20,35 @@ def extract_df_from_participant(p_obj) -> pd.DataFrame:
         raise ValueError(f"Unable to extract DataFrame from participant object: {p_obj}")
 
 
-def process_toc_experiment_data(df: pd.DataFrame, ttc_threshold: float = 1.5) -> pd.DataFrame:
+def filter_experiment_data(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """
+    Find participant whose specific dataframe match the applied filter
+    :param df:
+    :param kwargs:
+    :return:
+    """
+    conditions = []
+
+    for key, value in kwargs.items():
+        if key.endswith('_min'):
+            col = key.replace('_min', '')
+            conditions.append(f"{col} >= @kwargs['{key}']")
+        elif key.endswith('_max'):
+            col = key.replace('_max', '')
+            conditions.append(f"{col} <= @kwargs['{key}']")
+        else:
+            conditions.append(f"{key} == @kwargs['{key}']")
+
+    query_str = " & ".join(conditions)
+    return df.query(query_str)
+
+
+def process_toc_experiment_data(df: pd.DataFrame, ttc_threshold: float = 5) -> pd.DataFrame:
     """
     Processes multi-participant telemetry:
     1. Filters out unknown scenarios (allows only A, B, C, D).
     2. Calculates Manual Driving % relative to the first Sim_End timestep.
-    3. Flags prior failure experience if Scenario B/D occurred AND TTC <= 1.5s.
+    3. Flags prior failure experience if Scenario B/D occurred AND TTC Threshold Triggered.
     """
     valid_scenarios = {'A', 'B', 'C', 'D'}
     records = []
@@ -37,10 +59,11 @@ def process_toc_experiment_data(df: pd.DataFrame, ttc_threshold: float = 1.5) ->
 
         had_prior_failure_exp = False
 
-        for trial_idx, folder in enumerate(sorted_folders):
+        for trial_idx, folder in enumerate(sorted_folders[3:]):
             group = run_groups.get_group(folder).sort_values('Timestep')
+            initial_row = group.iloc[0]
 
-            scenario = group['Scenario_Name'].iloc[0]
+            scenario = initial_row['Scenario_Name']
             if scenario not in valid_scenarios:
                 continue
 
@@ -61,7 +84,8 @@ def process_toc_experiment_data(df: pd.DataFrame, ttc_threshold: float = 1.5) ->
             manual_pct = (manual_timesteps / sim_end_timestep) * 100.0
 
             # Option 2: Critical TTC Near-Miss Check (0 < TTC <= ttc_threshold)
-            valid_ttc = valid_group[valid_group['TTC'] > 0]
+            tailgate_onset = initial_row['Tailgate_Onset']
+            valid_ttc = filter_experiment_data(valid_group,Timestep_min=tailgate_onset)
             experienced_near_miss = not valid_ttc[valid_ttc['TTC'] <= ttc_threshold].empty
             min_ttc = valid_ttc['TTC'].min() if not valid_ttc.empty else np.nan
 
@@ -82,37 +106,106 @@ def process_toc_experiment_data(df: pd.DataFrame, ttc_threshold: float = 1.5) ->
 
     return pd.DataFrame(records)
 
+def process_takeover_aligned_telemetry(
+    df: pd.DataFrame,
+    pre_window_sec: float = 4.0,
+    post_window_sec: float = 4.0,
+    fps: float = 20.0
+) -> pd.DataFrame:
 
-def process_takeover_aligned_telemetry(df: pd.DataFrame, window_sec: float = 4.0, fps: float = 10.0) -> pd.DataFrame:
-    """Slices frame-by-frame telemetry centered at takeover moment (Driver_TO == True at T = 0)."""
     valid_scenarios = {'A', 'B', 'C', 'D'}
-    window_frames = int(window_sec * fps)
+
+    pre_frames = int(pre_window_sec * fps)
+    post_frames = int(post_window_sec * fps)
+
     aligned_records = []
 
-    for (participant_id, folder), group in df.groupby(['Participant', 'Folder_Num']):
-        group = group.sort_values('Timestep')
-        scenario = group['Scenario_Name'].iloc[0]
+    for (participant_id, folder), group in df.groupby(
+        ['Participant', 'Folder_Num']
+    ):
+        group = group.sort_values('Timestep').reset_index(drop=True)
+
+        # Make sure there is exactly one scenario
+        scenarios = group['Scenario_Name'].dropna().unique()
+
+        if len(scenarios) != 1:
+            continue
+
+        scenario = scenarios[0]
 
         if scenario not in valid_scenarios:
             continue
 
-        to_rows = group[group['Driver_TO'] == True]
-        if to_rows.empty:
+        # Find takeover
+        to_positions = group.index[
+            group['Driver_TO'].eq(True)
+        ]
+
+        if len(to_positions) == 0:
             continue
 
-        to_step = to_rows['Timestep'].iloc[0]
-        to_idx = group.index[group['Timestep'] == to_step][0]
-        pos_in_group = group.index.get_loc(to_idx)
+        # First takeover
+        to_pos = to_positions[0]
+        to_step = group.loc[to_pos, 'Timestep']
 
-        start_pos = max(0, pos_in_group - window_frames)
-        end_pos = min(len(group), pos_in_group + window_frames)
+        # Require complete window
+        if to_pos < pre_frames:
+            continue
 
-        sub_df = group.iloc[start_pos:end_pos].copy()
-        sub_df['Relative_Time_Sec'] = (sub_df['Timestep'] - to_step) / fps
+        if to_pos + post_frames >= len(group):
+            continue
+
+        # Include both endpoints
+        sub_df = group.iloc[
+            to_pos - pre_frames:
+            to_pos + post_frames + 1
+        ].copy()
+
+        sub_df['Relative_Time_Sec'] = (
+            sub_df['Timestep'] - to_step
+        ) / fps
+
         sub_df['Participant'] = participant_id
+
         aligned_records.append(sub_df)
 
-    return pd.concat(aligned_records, ignore_index=True) if aligned_records else pd.DataFrame()
+    if not aligned_records:
+        return pd.DataFrame()
+
+    return pd.concat(
+        aligned_records,
+        ignore_index=True
+    )
+# def process_takeover_aligned_telemetry(df: pd.DataFrame, window_sec: float = 4.0, fps: float = 20.0) -> pd.DataFrame:
+#     """Slices frame-by-frame telemetry centered at takeover moment (Driver_TO == True at T = 0)."""
+#     valid_scenarios = {'A', 'B', 'C', 'D'}
+#     window_frames = int(window_sec * fps)
+#     aligned_records = []
+#
+#     for (participant_id, folder), group in df.groupby(['Participant', 'Folder_Num']):
+#         group = group.sort_values('Timestep')
+#         scenario = group['Scenario_Name'].iloc[0]
+#
+#         if scenario not in valid_scenarios:
+#             continue
+#
+#         to_rows = group[group['Driver_TO'] == True]
+#         if to_rows.empty:
+#             continue
+#
+#         to_step = to_rows['Timestep'].iloc[0]
+#         to_idx = group.index[group['Timestep'] == to_step][0]
+#         pos_in_group = group.index.get_loc(to_idx)
+#
+#         start_pos = max(0, pos_in_group - window_frames)
+#         end_pos = min(len(group), pos_in_group + window_frames)
+#
+#         sub_df = group.iloc[start_pos:end_pos].copy()
+#         sub_df['Relative_Time_Sec'] = (sub_df['Timestep'] - to_step) / fps
+#         sub_df['Participant'] = participant_id
+#         aligned_records.append(sub_df)
+#
+#     return pd.concat(aligned_records, ignore_index=True) if aligned_records else pd.DataFrame()
 
 
 # --- Plotting Functions ---
@@ -172,28 +265,139 @@ def plot_failure_impact(summary_df: pd.DataFrame, p_name: str) -> plt.Figure:
     return fig
 
 
-def plot_takeover_trajectory(aligned_df: pd.DataFrame, p_name: str) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(6, 4))
+def plot_takeover_trajectory(
+    aligned_df: pd.DataFrame,
+    p_name: str
+) -> list[plt.Figure]:
 
-    sns.lineplot(
-        data=aligned_df,
-        x='Relative_Time_Sec',
-        y='Brake_Contr',
-        hue='Scenario_Name',
-        hue_order=['A', 'B', 'C', 'D'],
-        palette='Set1',
-        errorbar=None,
-        ax=ax
-    )
+    scenarios = ['A', 'B', 'C', 'D']
+    figures = []
 
-    ax.axvline(0, color='black', linestyle='--', linewidth=1, label='Takeover ($T=0$)')
-    ax.set_title(f"Takeover Control Profile ({p_name})", fontsize=11, fontweight='bold')
-    ax.set_xlabel('Time Relative to Takeover (s)', fontsize=9)
-    ax.set_ylabel('Brake Control Input', fontsize=9)
-    ax.legend(title='Scenario', fontsize=8, title_fontsize=8, loc='upper left')
-    plt.tight_layout()
-    return fig
+    for scenario in scenarios:
 
+        df_sub = aligned_df[
+            aligned_df['Scenario_Name'] == scenario
+        ].copy()
+
+        if df_sub.empty:
+            continue
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        # Mean trajectory
+        sns.lineplot(
+            data=df_sub,
+            x='Relative_Time_Sec',
+            y='Brake_Contr',
+            errorbar=None,
+            ax=ax
+        )
+
+        # 25th and 75th percentiles
+        quantiles = (
+            df_sub
+            .groupby('Relative_Time_Sec')['Brake_Contr']
+            .quantile([0.25, 0.75])
+            .unstack()
+            .reset_index()
+        )
+
+        # IQR boundaries
+        ax.plot(
+            quantiles['Relative_Time_Sec'],
+            quantiles[0.25],
+            linestyle=':',
+            alpha=0.8,
+            label='25th percentile'
+        )
+
+        ax.plot(
+            quantiles['Relative_Time_Sec'],
+            quantiles[0.75],
+            linestyle=':',
+            alpha=0.8,
+            label='75th percentile'
+        )
+
+        # Takeover moment
+        ax.axvline(
+            0,
+            color='black',
+            linestyle='--',
+            linewidth=1,
+            label='Takeover ($T=0$)'
+        )
+
+        ax.set_title(
+            f"Takeover Control Profile — Scenario {scenario} ({p_name})",
+            fontsize=11,
+            fontweight='bold'
+        )
+
+        ax.set_xlabel(
+            'Time Relative to Takeover (s)',
+            fontsize=9
+        )
+
+        ax.set_ylabel(
+            'Brake Control Input',
+            fontsize=9
+        )
+
+        ax.legend(
+            fontsize=8,
+            loc='upper left'
+        )
+
+        plt.tight_layout()
+
+        figures.append(fig)
+
+    return figures
+#
+# def plot_takeover_trajectory(aligned_df: pd.DataFrame, p_name: str) -> plt.Figure:
+#     fig, ax = plt.subplots(figsize=(6, 4))
+#
+#     # Define the scenario order and color palette so we can reuse it
+#     scenarios = ['A', 'B', 'C', 'D']
+#     palette = sns.color_palette('Set1', n_colors=len(scenarios))
+#     color_dict = dict(zip(scenarios, palette))
+#
+#     # 1. Plot the main mean lines (without default shaded error bars)
+#     sns.lineplot(
+#         data=aligned_df,
+#         x='Relative_Time_Sec',
+#         y='Brake_Contr',
+#         hue='Scenario_Name',
+#         hue_order=scenarios,
+#         palette=color_dict,
+#         errorbar=None,
+#         ax=ax
+#     )
+#
+#     # 2. Calculate the 25th and 75th percentiles grouped by Scenario and Time
+#     quantiles = aligned_df.groupby(['Scenario_Name', 'Relative_Time_Sec'])['Brake_Contr'] \
+#         .quantile([0.25, 0.75]).unstack().reset_index()
+#
+#     # 3. Overlay the dotted lines for the calculated percentiles
+#     for scenario in scenarios:
+#         df_sub = quantiles[quantiles['Scenario_Name'] == scenario]
+#         if not df_sub.empty:
+#             # Plot 25th percentile
+#             ax.plot(df_sub['Relative_Time_Sec'], df_sub[0.25],
+#                     color=color_dict[scenario], linestyle=':', alpha=0.8, label='_nolegend_')
+#             # Plot 75th percentile
+#             ax.plot(df_sub['Relative_Time_Sec'], df_sub[0.75],
+#                     color=color_dict[scenario], linestyle=':', alpha=0.8, label='_nolegend_')
+#
+#     ax.axvline(0, color='black', linestyle='--', linewidth=1, label='Takeover ($T=0$)')
+#     ax.set_title(f"Takeover Control Profile ({p_name})", fontsize=11, fontweight='bold')
+#     ax.set_xlabel('Time Relative to Takeover (s)', fontsize=9)
+#     ax.set_ylabel('Brake Control Input', fontsize=9)
+#     ax.legend(title='Scenario', fontsize=8, title_fontsize=8, loc='upper left')
+#
+#     plt.tight_layout()
+#     return fig
 
 # --- Main Entry Point for Streamlit ---
 
@@ -241,11 +445,13 @@ def create_participant_graphs(participant_objs) -> dict:
     ]
 
     if not aligned_df.empty:
-        p_graphs.append({
-            "id": f"Overall_takeover_profile",
-            "title": f"Takeover Control Profile - Overall",
-            "fig": plot_takeover_trajectory(aligned_df, "Overall")
-        })
+        figs = plot_takeover_trajectory(aligned_df, "Overall")
+        for i in range(0,len(figs)):
+            p_graphs.append({
+                "id": f"takeover_profile - {i}",
+                "title": f"Takeover Control Profile - {i}",
+                "fig": figs[i]
+            })
 
     graphs_dict["Overall"] = p_graphs
 
