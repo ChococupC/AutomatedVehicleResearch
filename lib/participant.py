@@ -24,6 +24,9 @@ class Participant:
         output_data = [ i.to_dict() for i in self.data_frame ]
         return output_data
 
+    def get_data_frame(self) -> pd.DataFrame:
+        return self.data_frame
+
     def is_processed(self):
         return self.is_processed
 

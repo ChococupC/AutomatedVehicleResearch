@@ -37,6 +37,22 @@ def create_participants(uploaded_files: list) -> list:
     print(f"Participants created")
     return successful_participants
 
+def create_participants_by_data_folder(paths = "data") -> list:
+    """
+    Processes all given files (paths or uploads).
+    Creates and returns as many successful Participant objects as possible.
+    """
+    folder = Path(paths)
+
+    # Generates a list of full paths for files only
+    file_paths = [str(file.resolve()) for file in folder.iterdir() if file.is_file()]
+
+    p_objs = create_participants(file_paths)
+    load_participants(p_objs)
+
+    print(f"Participants created")
+    return p_objs
+
 
 # General Tools
 class ExcelConverter:
